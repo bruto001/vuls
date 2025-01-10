@@ -1,15 +1,14 @@
 //go:build !scanner
-// +build !scanner
 
 package detector
 
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"github.com/future-architect/vuls/config"
@@ -46,7 +45,7 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
 			r.ScannedCves = models.VulnInfos{}
 		}
 
-		if err := DetectLibsCves(&r, config.Conf.TrivyCacheDBDir, config.Conf.NoProgress); err != nil {
+		if err := DetectLibsCves(&r, config.Conf.TrivyOpts, config.Conf.LogOpts, config.Conf.NoProgress); err != nil {
 			return nil, xerrors.Errorf("Failed to fill with Library dependency: %w", err)
 		}
 
@@ -204,7 +203,7 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
 			return nil, xerrors.Errorf("Failed to fill with gost: %w", err)
 		}
 
-		if err := FillCvesWithNvdJvnFortinet(&r, config.Conf.CveDict, config.Conf.LogOpts); err != nil {
+		if err := FillCvesWithGoCVEDictionary(&r, config.Conf.CveDict, config.Conf.LogOpts); err != nil {
 			return nil, xerrors.Errorf("Failed to fill with CVE: %w", err)
 		}
 
@@ -435,8 +434,8 @@ func DetectWordPressCves(r *models.ScanResult, wpCnf config.WpScanConf) error {
 	return nil
 }
 
-// FillCvesWithNvdJvnFortinet fills CVE detail with NVD, JVN, Fortinet
-func FillCvesWithNvdJvnFortinet(r *models.ScanResult, cnf config.GoCveDictConf, logOpts logging.LogOpts) (err error) {
+// FillCvesWithGoCVEDictionary fills CVE detail with NVD, JVN, Fortinet, MITRE
+func FillCvesWithGoCVEDictionary(r *models.ScanResult, cnf config.GoCveDictConf, logOpts logging.LogOpts) (err error) {
 	cveIDs := []string{}
 	for _, v := range r.ScannedCves {
 		cveIDs = append(cveIDs, v.CveID)
@@ -461,6 +460,7 @@ func FillCvesWithNvdJvnFortinet(r *models.ScanResult, cnf config.GoCveDictConf, 
 		nvds, exploits, mitigations := models.ConvertNvdToModel(d.CveID, d.Nvds)
 		jvns := models.ConvertJvnToModel(d.CveID, d.Jvns)
 		fortinets := models.ConvertFortinetToModel(d.CveID, d.Fortinets)
+		mitres := models.ConvertMitreToModel(d.CveID, d.Mitres)
 
 		alerts := fillCertAlerts(&d)
 		for cveID, vinfo := range r.ScannedCves {
@@ -470,22 +470,20 @@ func FillCvesWithNvdJvnFortinet(r *models.ScanResult, cnf config.GoCveDictConf, 
 				}
 				for _, con := range nvds {
 					if !con.Empty() {
-						vinfo.CveContents[con.Type] = []models.CveContent{con}
+						vinfo.CveContents[con.Type] = append(vinfo.CveContents[con.Type], con)
 					}
 				}
 				for _, con := range append(jvns, fortinets...) {
 					if !con.Empty() {
-						found := false
-						for _, cveCont := range vinfo.CveContents[con.Type] {
-							if con.SourceLink == cveCont.SourceLink {
-								found = true
-								break
-							}
-						}
-						if !found {
+						if !slices.ContainsFunc(vinfo.CveContents[con.Type], func(e models.CveContent) bool {
+							return con.SourceLink == e.SourceLink
+						}) {
 							vinfo.CveContents[con.Type] = append(vinfo.CveContents[con.Type], con)
 						}
 					}
+				}
+				for _, con := range mitres {
+					vinfo.CveContents[con.Type] = append(vinfo.CveContents[con.Type], con)
 				}
 				vinfo.AlertDict = alerts
 				vinfo.Exploits = append(vinfo.Exploits, exploits...)
@@ -639,7 +637,9 @@ func DetectCpeURIsCves(r *models.ScanResult, cpes []Cpe, cnf config.GoCveDictCon
 			if val, ok := r.ScannedCves[detail.CveID]; ok {
 				val.CpeURIs = util.AppendIfMissing(val.CpeURIs, cpe.CpeURI)
 				val.Confidences.AppendIfMissing(maxConfidence)
-				val.DistroAdvisories = advisories
+				for _, adv := range advisories {
+					val.DistroAdvisories.AppendIfMissing(&adv)
+				}
 				r.ScannedCves[detail.CveID] = val
 			} else {
 				v := models.VulnInfo{
